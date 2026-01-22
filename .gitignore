@@ -1,0 +1,9 @@
+/target
+/debug
+/release
+**/*.rs.bk
+*.swp
+*.pdb
+.idea
+.vscode
+.DS_Store

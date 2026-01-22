@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package compression;
+
+service CompressionService {
+  rpc CompressPdf (CompressRequest) returns (CompressResponse);
+}
+
+message CompressRequest {
+  bytes pdf_data = 1;
+  // Optional configuration can be added here
+  // int32 quality = 2; 
+}
+
+message CompressResponse {
+  bytes compressed_pdf_data = 1;
+}
