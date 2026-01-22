@@ -22,11 +22,14 @@ use crate::compression::compress_pdf;
 )]
 pub struct ApiDoc;
 
+use axum::extract::DefaultBodyLimit;
+
 pub fn app_router() -> Router {
     Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/compress", post(compress_handler_multipart))
         .route("/health", get(|| async { "OK" }))
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB limit
 }
 
 /// Compress a PDF file uploaded via multipart form
