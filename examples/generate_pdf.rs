@@ -44,18 +44,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     doc.trailer.set("Root", catalog_id);
     
     // Add a large random image to simulate content
-    // Create 2000x2000 image
-    let width = 2000;
-    let height = 2000;
+    // Create 4000x4000 image (16MP) to force downscaling
+    let width = 4000;
+    let height = 4000;
     let mut img_buf: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(width, height);
+    
+    // Generate an interference pattern (looks somewhat like a natural texture)
     for (x, y, pixel) in img_buf.enumerate_pixels_mut() {
-        // Gradient pattern which compresses better than random noise
-        *pixel = Rgb([((x as f32 / width as f32) * 255.0) as u8, ((y as f32 / height as f32) * 255.0) as u8, 128]);
+        let cx = x as f32 / 200.0;
+        let cy = y as f32 / 200.0;
+        let v = (cx.sin() + cy.cos() + (cx + cy).sin()) / 3.0;
+        let c = ((v * 0.5 + 0.5) * 255.0) as u8;
+        *pixel = Rgb([c, (c as u16 * 2 % 255) as u8, (255 - c)]);
     }
     
     let mut jpeg_data = Vec::new();
-    // High quality to make it large
-    img_buf.write_to(&mut Cursor::new(&mut jpeg_data), image::ImageFormat::Jpeg).unwrap();
+    // High quality (95) to simulate an unoptimized source
+    {
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, 95);
+        encoder.encode(img_buf.as_bytes(), width, height, image::ColorType::Rgb8).unwrap();
+    }
     
     let image_stream = Stream::new(
         Dictionary::from_iter(vec![

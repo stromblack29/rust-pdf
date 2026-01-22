@@ -3,8 +3,8 @@ use std::fs;
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let input_path = "test_large.pdf";
-    let output_path = "test_compressed.pdf";
+    let input_path = "Policy EasyCare VISA[LTR] Online_G9022138.pdf";
+    let output_path = "Policy_compressed.pdf";
     
     let input_data = fs::read(input_path)?;
     println!("Original size: {} bytes", input_data.len());

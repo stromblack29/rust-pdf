@@ -41,9 +41,16 @@ pub fn compress_pdf(input: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error +
     
     for object_id in image_ids {
         // We have to handle errors gracefully to avoid failing the whole PDF if one image fails
-        if let Ok(processed_stream) = process_image_object(&doc, object_id) {
-            if let Some(obj) = doc.objects.get_mut(&object_id) {
-                *obj = processed_stream;
+        println!("Processing image {:?}", object_id);
+        match process_image_object(&doc, object_id) {
+            Ok(processed_stream) => {
+                println!("Successfully processed image {:?}", object_id);
+                if let Some(obj) = doc.objects.get_mut(&object_id) {
+                    *obj = processed_stream;
+                }
+            },
+            Err(e) => {
+                println!("Failed to process image {:?}: {}", object_id, e);
             }
         }
     }
@@ -81,54 +88,95 @@ fn process_image_object(doc: &Document, object_id: (u32, u16)) -> Result<Object,
     // A robust PDF image extractor works by checking filters.
     
     let filters = stream.dict.get(b"Filter");
+    println!("Image {:?} filters: {:?}", object_id, filters);
+    
     let is_jpeg = match filters {
         Ok(Object::Name(name)) => name == b"DCTDecode",
         Ok(Object::Array(arr)) => arr.contains(&Object::Name(b"DCTDecode".to_vec())),
         _ => false,
     };
 
-    // If it's already JPEG, we might still want to downscale.
-    // But decoding PDF image streams is complex (ColorSpace, BitsPerComponent).
-    // For this MVP, we will try to decode using `lopdf::Stream::decode` which handles Flate/LZW etc.
-    
     let decoded_bytes = match stream.decompressed_content() {
         Ok(bytes) => bytes,
-        Err(_) => return Err("Failed to decompress".into()),
+        Err(e) => {
+             // If it fails, maybe we can use raw content if it is just DCTDecode
+             if is_jpeg {
+                  println!("Decompression failed but identified as JPEG. Using raw content.");
+                  stream.content.clone()
+             } else {
+                  return Err(format!("Failed to decompress: {:?}", e).into());
+             }
+        },
     };
 
     // Now we have raw bytes. But we need to know the dimensions and color space to form an image.
     let width = stream.dict.get(b"Width").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
     let height = stream.dict.get(b"Height").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
-    // let color_space = stream.dict.get(b"ColorSpace"); // Needed for interpretation
+    let bits = stream.dict.get(b"BitsPerComponent").and_then(|v| v.as_i64()).unwrap_or(8) as u8;
+    let color_space = stream.dict.get(b"ColorSpace").ok();
     
+    println!("Image {:?} Metadata: W={} H={} Bits={} CS={:?}", object_id, width, height, bits, color_space);
+
     if width == 0 || height == 0 {
          return Err("Invalid dimensions".into());
     }
 
-    // This is the tricky part: standardizing the image data for `image` crate.
-    // If it was DCTDecode, `decoded_bytes` might still be the raw JPEG stream if we accessed `content` directly, 
-    // but `decompressed_content` tries to undo filters.
-    // If `is_jpeg` is true, simple decoding might fail if we want the actual JPEG bytes vs raw pixels.
-    
-    // Better approach for MVP:
-    // If it is DCTDecode (JPEG), try to load it as an image directly from raw content (before decompressing).
-    // If it is FlateDecode, use decoded bytes and assume RGB/Grayscale? (Dangerous assumptions but common start).
-    
     let img: DynamicImage = if is_jpeg {
-         // Load from raw content (stream.content is likely the JPEG file)
-         // Note: PDF streams might have extra params.
-         ImageReader::new(Cursor::new(&stream.content))
-            .with_guessed_format()?
-            .decode()?
+         // Try loading as JPEG
+         let data = if decoded_bytes.len() > 0 { &decoded_bytes } else { &stream.content };
+         match ImageReader::new(Cursor::new(data)).with_guessed_format() {
+            Ok(reader) => reader.decode()?,
+            Err(e) => return Err(format!("Failed to read JPEG: {}", e).into()),
+         }
     } else {
-        // Raw pixel data. We need to construct based on Width/Height/ColorSpace/BitsPerComponent.
-        // This is complex. `image` crate can load from raw if we know the format.
-        // For now, let's skip re-compressing non-JPEG complex images to avoid corruption, 
-        // unless we are sure.
+        // Raw pixel data. 
+        // We only support standard RGB/Gray 8-bit for now to avoid complexity.
+        if bits != 8 {
+             return Err(format!("Unsupported bits per component: {}", bits).into());
+        }
         
-        // Simplified fallback: if we can't easily identify, skip.
-        // Or Try to form an ImageBuffer.
-        return Err("Non-JPEG image re-compression not fully implemented in MVP".into());
+        let is_rgb = match color_space {
+            Some(Object::Name(name)) => name == b"DeviceRGB",
+            Some(Object::Array(arr)) if arr.len() > 0 => {
+                 // Sometime it's [/ICCBased ref] or [/DeviceRGB]
+                 if let Some(Object::Name(n)) = arr.get(0) { n == b"DeviceRGB" } else { false }
+            },
+            _ => false // Default to false, check for grayscale
+        };
+        
+        let is_gray = match color_space {
+            Some(Object::Name(name)) => name == b"DeviceGray",
+             _ => false
+        };
+
+        if is_rgb {
+             if let Some(buf) = image::RgbImage::from_raw(width, height, decoded_bytes.into()) {
+                 DynamicImage::ImageRgb8(buf)
+             } else {
+                 return Err("Failed to create RGB buffer from raw bytes".into());
+             }
+        } else if is_gray {
+             if let Some(buf) = image::GrayImage::from_raw(width, height, decoded_bytes.into()) {
+                 DynamicImage::ImageLuma8(buf)
+             } else {
+                 return Err("Failed to create Gray buffer from raw bytes".into());
+             }
+        } else {
+             // Try CMYK or assume RGB if 3 bytes per pixel
+             if decoded_bytes.len() as u32 == width * height * 3 {
+                  if let Some(buf) = image::RgbImage::from_raw(width, height, decoded_bytes.into()) {
+                     DynamicImage::ImageRgb8(buf)
+                  } else {
+                      return Err("Failed to force create RGB buffer".into());
+                  }
+             } else if decoded_bytes.len() as u32 == width * height * 4 {
+                  // CMYK likely, but image crate doesn't natively support CMYK -> RGB easily without conversion.
+                  // We can convert CMYK to RGB naively.
+                   return Err("CMYK not fully supported in this MVP".into());
+             } else {
+                 return Err("Unknown ColorSpace or pixel format".into());
+             }
+        }
     };
 
     // Resize (Downscale)
