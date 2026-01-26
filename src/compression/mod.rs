@@ -1,11 +1,42 @@
 use lopdf::{Document, Object, Stream};
-use image::io::Reader as ImageReader;
+use image::ImageReader;
 use std::io::Cursor;
-use image::{DynamicImage, ImageFormat};
-use rayon::prelude::*;
+use image::DynamicImage;
+
+/// Configuration for PDF compression
+#[derive(Debug, Clone)]
+pub struct CompressionConfig {
+    /// JPEG quality (1-100). Lower = smaller file, lower quality. Default: 30 for 90% reduction
+    pub jpeg_quality: u8,
+    /// Maximum dimension in pixels. Images larger than this will be downscaled. Default: 600
+    pub max_dimension: u32,
+    /// Whether to remove metadata from the PDF. Default: true
+    pub remove_metadata: bool,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            jpeg_quality: 30,  // Very aggressive for 90% reduction
+            max_dimension: 600, // Smaller dimensions for 90% reduction
+            remove_metadata: true,
+        }
+    }
+}
 
 pub fn compress_pdf(input: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    compress_pdf_with_config(input, CompressionConfig::default())
+}
+
+pub fn compress_pdf_with_config(input: &[u8], config: CompressionConfig) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let mut doc = Document::load_mem(input)?;
+
+    println!("Starting compression with config: quality={}, max_dim={}", config.jpeg_quality, config.max_dimension);
+
+    // Remove metadata if configured
+    if config.remove_metadata {
+        remove_metadata(&mut doc);
+    }
 
     // Collect all stream objects that are images
     // We need to collect object IDs first to avoid borrowing issues while modifying
@@ -42,7 +73,7 @@ pub fn compress_pdf(input: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error +
     for object_id in image_ids {
         // We have to handle errors gracefully to avoid failing the whole PDF if one image fails
         println!("Processing image {:?}", object_id);
-        match process_image_object(&doc, object_id) {
+        match process_image_object(&doc, object_id, &config) {
             Ok(processed_stream) => {
                 println!("Successfully processed image {:?}", object_id);
                 if let Some(obj) = doc.objects.get_mut(&object_id) {
@@ -68,7 +99,32 @@ pub fn compress_pdf(input: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error +
     Ok(out_buffer)
 }
 
-fn process_image_object(doc: &Document, object_id: (u32, u16)) -> Result<Object, Box<dyn std::error::Error + Send + Sync>> {
+fn remove_metadata(doc: &mut Document) {
+    // Remove Info dictionary from trailer (contains metadata like Author, Title, etc.)
+    let _ = doc.trailer.remove(b"Info");
+    
+    // Try to remove Metadata stream from catalog if present
+    // We iterate through objects to find and remove metadata streams
+    let metadata_ids: Vec<_> = doc.objects.iter()
+        .filter(|(_, obj)| {
+            if let Ok(stream) = obj.as_stream() {
+                if let Ok(Object::Name(name)) = stream.dict.get(b"Type") {
+                    return name == b"Metadata";
+                }
+            }
+            false
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    
+    for id in metadata_ids {
+        doc.objects.remove(&id);
+    }
+    
+    println!("Removed PDF metadata");
+}
+
+fn process_image_object(doc: &Document, object_id: (u32, u16), config: &CompressionConfig) -> Result<Object, Box<dyn std::error::Error + Send + Sync>> {
     let object = doc.get_object(object_id)?;
     let stream = object.as_stream()?;
     
@@ -80,7 +136,7 @@ fn process_image_object(doc: &Document, object_id: (u32, u16)) -> Result<Object,
     // If it's a JPEG (DCTDecode), we can try to re-compress it if it's too large.
     // If it's a raw bitmap or PNG (FlateDecode), we can convert to JPEG.
     
-    let content_data = stream.content.clone(); 
+    let _content_data = stream.content.clone(); 
     // We interpret the stream. If it has filters, we should try to decode it.
     // However, lopdf `get_content` or `decode` doesn't fully handle all image conversion logic (like CMYK -> RGB).
     
@@ -179,19 +235,19 @@ fn process_image_object(doc: &Document, object_id: (u32, u16)) -> Result<Object,
         }
     };
 
-    // Resize (Downscale)
-    // Target: Max 800px on longest side, or preserve if smaller.
+    // Resize (Downscale) - use config settings
     let (w, h) = (img.width(), img.height());
-    let max_dim = 1200; // Reasonable quality
+    let max_dim = config.max_dimension;
     let new_img = if w > max_dim || h > max_dim {
-        img.resize(max_dim, max_dim, image::imageops::FilterType::Lanczos3)
+        // Use Triangle filter for faster processing with acceptable quality
+        img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle)
     } else {
         img
     };
 
-    // Re-encode to JPEG with lower quality
+    // Re-encode to JPEG with configured quality (lower = smaller file)
     let mut comp_bytes: Vec<u8> = Vec::new();
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut comp_bytes, 50);
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut comp_bytes, config.jpeg_quality);
     encoder.encode(new_img.as_bytes(), new_img.width(), new_img.height(), new_img.color().into())?;
     
     // Create new stream dictionary

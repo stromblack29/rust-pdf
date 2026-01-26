@@ -8,10 +8,22 @@ service CompressionService {
 
 message CompressRequest {
   bytes pdf_data = 1;
-  // Optional configuration can be added here
-  // int32 quality = 2; 
+  optional CompressionConfig config = 2;
+}
+
+message CompressionConfig {
+  // JPEG quality (1-100). Lower = smaller file, lower quality. Default: 30
+  optional uint32 jpeg_quality = 1;
+  // Maximum dimension in pixels. Images larger will be downscaled. Default: 600
+  optional uint32 max_dimension = 2;
+  // Whether to remove metadata from the PDF. Default: true
+  optional bool remove_metadata = 3;
 }
 
 message CompressResponse {
   bytes compressed_pdf_data = 1;
+  // Statistics about the compression
+  uint64 original_size = 2;
+  uint64 compressed_size = 3;
+  float compression_ratio = 4;
 }
